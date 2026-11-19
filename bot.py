@@ -574,7 +574,33 @@ def main():
 
     logging.info("Kareem office bot is running...")
     app.run_polling()
+import urllib.request
 
+
+def execute_tool_from_config(tool_code: str) -> str:
+    res = supabase.table("tools").select("config").eq("code", tool_code).execute()
+    data = res.data
+    if not data:
+        return f"الأداة {tool_code} غير موجودة."
+
+    config = data[0].get("config", {})
+    script_url = config.get("script_url")
+    dev_token = config.get("developer_token")
+
+    if script_url:
+        try:
+            req = urllib.request.Request(
+                script_url, headers={"User-Agent": "KareemOfficeBot/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=15) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            return f"خطأ في الاتصال بالرابط: {e}"
+
+    elif dev_token:
+        return f"مفتاح الإعلانات جاهز، بانتظار ربط مسار التحليل. التوكن: {dev_token[:5]}..."
+
+    return "لم يتم العثور على رابط أو توكن صالح في الإعدادات."
 
 if __name__ == "__main__":
     main()
