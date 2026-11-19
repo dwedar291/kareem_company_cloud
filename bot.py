@@ -2,6 +2,8 @@ import os
 import json
 import logging
 import threading
+import urllib.request
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
@@ -12,6 +14,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
@@ -47,7 +51,12 @@ def start_health_server():
 def parse_json_response(text: str) -> dict:
     raw = (text or "").strip()
     if raw.startswith("```"):
-        raw = raw.strip("`")
+        lines = raw.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
         if raw.lower().startswith("json"):
             raw = raw[4:].strip()
     return json.loads(raw)
@@ -77,7 +86,7 @@ def get_active_agents_with_tools() -> list[dict]:
             "name": ag.get("name"),
             "role": ag.get("role"),
             "system_prompt": ag.get("system_prompt") or "",
-            "model_name": ag.get("model_name") or "gemini-3.5-flash-lite",
+            "model_name": ag.get("model_name") or DEFAULT_MODEL,
             "can_hire": bool(ag.get("can_hire")),
             "can_evolve": bool(ag.get("can_evolve")),
             "version": ag.get("version") or 1,
@@ -106,6 +115,84 @@ def tool_create_task(title: str, assigned_agent_code: str = "manager", priority:
     return {"ok": True, "task": (res.data or [{}])[0]}
 
 
+def tool_http_request(method: str, url: str, params: dict | None = None, body: dict | None = None) -> dict:
+    clean_method = (method or "GET").upper().strip()
+    clean_url = (url or "").strip()
+    if not clean_url.startswith(("http://", "https://")):
+        return {"ok": False, "error": "الرابط يجب أن يبدأ بـ http:// أو https://"}
+
+    if params:
+        sep = "&" if "?" in clean_url else "?"
+        clean_url = f"{clean_url}{sep}{urllib.parse.urlencode(params)}"
+
+    data_bytes = None
+    headers = {"User-Agent": "KareemOfficeBot/1.0"}
+    if clean_method in ("POST", "PUT", "PATCH") and body is not None:
+        data_bytes = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(clean_url, data=data_bytes, headers=headers, method=clean_method)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw_body = resp.read().decode("utf-8", errors="replace")
+        return {"ok": True, "status": resp.status, "response": raw_body[:2000]}
+
+
+def tool_register_tool(
+    actor_code: str,
+    code: str,
+    name: str,
+    description: str,
+    assign_to_agent_code: str = "manager",
+    config: dict | None = None,
+) -> dict:
+    clean_code = (code or "").strip().lower().replace(" ", "_")
+    if not clean_code:
+        return {"ok": False, "error": "كود الأداة مطلوب"}
+
+    existing = supabase.table("tools").select("id, code").eq("code", clean_code).execute().data or []
+    if existing:
+        tool_id = existing[0]["id"]
+        supabase.table("tools").update({
+            "name": name.strip(),
+            "description": description.strip(),
+            "is_enabled": True,
+            "config": config or {"type": "http"},
+        }).eq("id", tool_id).execute()
+    else:
+        inserted = supabase.table("tools").insert({
+            "code": clean_code,
+            "name": name.strip(),
+            "description": description.strip(),
+            "is_enabled": True,
+            "config": config or {"type": "http"},
+        }).execute()
+        tool_id = (inserted.data or [{}])[0].get("id")
+
+    target_ag_code = (assign_to_agent_code or "manager").strip()
+    ag_rows = supabase.table("agents").select("id, code").eq("code", target_ag_code).execute().data or []
+    if tool_id and ag_rows:
+        ag_id = ag_rows[0]["id"]
+        links = (
+            supabase.table("agent_tools")
+            .select("id")
+            .eq("agent_id", ag_id)
+            .eq("tool_id", tool_id)
+            .execute()
+            .data
+            or []
+        )
+        if not links:
+            supabase.table("agent_tools").insert({"agent_id": ag_id, "tool_id": tool_id}).execute()
+
+    log_evolution(
+        actor_code=actor_code,
+        action_type="register_tool",
+        target_code=clean_code,
+        details={"name": name, "assigned_to": target_ag_code},
+    )
+    return {"ok": True, "tool_code": clean_code, "assigned_to": target_ag_code}
+
+
 def tool_hire_agent(
     actor_code: str,
     code: str,
@@ -126,7 +213,7 @@ def tool_hire_agent(
         "name": name.strip(),
         "role": role.strip(),
         "system_prompt": system_prompt.strip(),
-        "model_name": "gemini-3.5-flash-lite",
+        "model_name": DEFAULT_MODEL,
         "can_hire": bool(can_hire),
         "can_evolve": bool(can_evolve),
         "is_active": True,
@@ -215,6 +302,53 @@ def tool_assign_tool(actor_code: str, target_agent_code: str, tool_code: str) ->
     return {"ok": True, "agent_code": target_agent_code.strip(), "tool_code": tool_code.strip()}
 
 
+def run_product_tool_builder(instruction: str, available_tools: list[str]) -> list[str]:
+    pm_agents = get_active_agents_with_tools()
+    pm = next((a for a in pm_agents if a["code"] == "product_manager"), None)
+    if not pm:
+        return []
+
+    prompt = f"""
+{pm.get("system_prompt", "")}
+
+الأدوات المتاحة لك حالياً: {json.dumps(available_tools, ensure_ascii=False)}
+المطلوب: "{instruction}"
+
+إذا كانت هناك حاجة لتسجيل أداة جديدة في قاعدة البيانات، أعد JSON فقط بالشكل التالي:
+{{
+  "register_tools": [
+    {{
+      "code": "كود_الأداة_بالإنجليزية",
+      "name": "اسم الأداة",
+      "description": "وصف الأداة وطريقة استخدامها",
+      "assign_to_agent_code": "كود الموظف المستفيد مثل calendar_assistant أو media_analyst أو manager",
+      "config": {{"type": "http", "endpoint_hint": ""}}
+    }}
+  ],
+  "summary": "ملخص مختصر"
+}}
+"""
+    res = gemini_client.models.generate_content(
+        model=pm.get("model_name") or DEFAULT_MODEL,
+        contents=prompt,
+    )
+    parsed = parse_json_response(res.text or "{}")
+    notes = []
+    for item in parsed.get("register_tools") or []:
+        if item.get("code") and item.get("name"):
+            r = tool_register_tool(
+                actor_code="product_manager",
+                code=item["code"],
+                name=item["name"],
+                description=item.get("description") or item["name"],
+                assign_to_agent_code=item.get("assign_to_agent_code") or "manager",
+                config=item.get("config") or {"type": "http"},
+            )
+            if r.get("ok"):
+                notes.append(f"طارق سجّل أداة جديدة: {r['tool_code']} وربطها بـ {r['assigned_to']}")
+    return notes
+
+
 def run_hr_execution(hr_agent: dict, hr_instruction: str, available_tool_codes: list[str]) -> list[dict]:
     prompt = f"""
 {hr_agent.get("system_prompt", "")}
@@ -230,14 +364,14 @@ def run_hr_execution(hr_agent: dict, hr_instruction: str, available_tool_codes: 
   "actions": [
     {{
       "action": "hire_agent" أو "update_prompt" أو "assign_tool",
-      "code": "كود الموظف الجديد بالإنجليزية بحروف صغيرة (مثال: sales_agent)",
+      "code": "كود الموظف الجديد بالإنجليزية بحروف صغيرة",
       "name": "اسم الموظف الجديد",
       "role": "دور الموظف الجديد",
       "system_prompt": "تعليمات واضحة للموظف الجديد",
       "tools": ["create_task"],
-      "target_code": "كود الموظف المراد تطويره في حالة update_prompt أو assign_tool",
-      "new_system_prompt": "التعليمات المحدثة في حالة update_prompt",
-      "tool_code": "كود الأداة في حالة assign_tool",
+      "target_code": "كود الموظف المراد تطويره",
+      "new_system_prompt": "التعليمات المحدثة",
+      "tool_code": "كود الأداة",
       "reason": "سبب التطوير أو التعيين"
     }}
   ],
@@ -245,7 +379,7 @@ def run_hr_execution(hr_agent: dict, hr_instruction: str, available_tool_codes: 
 }}
 """
     res = gemini_client.models.generate_content(
-        model=hr_agent.get("model_name") or "gemini-3.5-flash-lite",
+        model=hr_agent.get("model_name") or DEFAULT_MODEL,
         contents=prompt,
     )
     parsed = parse_json_response(res.text or "{}")
@@ -259,7 +393,7 @@ def run_hr_execution(hr_agent: dict, hr_instruction: str, available_tool_codes: 
                 code=act.get("code") or "specialist_agent",
                 name=act.get("name") or "موظف متخصص",
                 role=act.get("role") or "متابعة المهام المتخصصة",
-                system_prompt=act.get("system_prompt") or "أنت موظف متخصص تنفذ المهام المسندة إليك بدقة.",
+                system_prompt=act.get("system_prompt") or "أنت موظف متخصص تنفذ المهام المسندة إليك بدقة وتقدم تقريرك للمدير العام.",
                 tool_codes=act.get("tools") or ["create_task"],
             )
             results.append(r)
@@ -280,6 +414,48 @@ def run_hr_execution(hr_agent: dict, hr_instruction: str, available_tool_codes: 
             results.append(r)
 
     return results
+
+
+def execute_pending_tasks_for_team(agents: list[dict], limit: int = 3) -> list[str]:
+    agents_by_code = {a["code"]: a for a in agents if a.get("code") != "manager"}
+    pending_res = (
+        supabase.table("tasks")
+        .select("*")
+        .eq("status", "pending")
+        .order("id", desc=False)
+        .limit(limit)
+        .execute()
+    )
+    pending_tasks = pending_res.data or []
+    summaries = []
+
+    for task in pending_tasks:
+        target_code = task.get("assigned_agent_code") or ""
+        worker = agents_by_code.get(target_code)
+        if not worker:
+            continue
+
+        prompt = f"""
+{worker.get("system_prompt", "")}
+
+مهمة مسندة إليك من المدير العام (كريم):
+العنوان: {task.get("title")}
+الملاحظات: {task.get("notes") or ""}
+
+نفّذ المهمة بأفضل صورة عملية ومختصرة واكتب النتيجة النهائية ليقوم كريم برفعها لأستاذ مصطفى.
+"""
+        res = gemini_client.models.generate_content(
+            model=worker.get("model_name") or DEFAULT_MODEL,
+            contents=prompt,
+        )
+        output_text = (res.text or "تم الإنجاز.").strip()
+        supabase.table("tasks").update({
+            "status": "completed",
+            "notes": f"{task.get('notes') or ''}\n[نتيجة {worker.get('name')}]: {output_text}".strip(),
+        }).eq("id", task["id"]).execute()
+        summaries.append(f"{worker.get('name')} ({worker.get('role')}): {output_text}")
+
+    return summaries
 
 
 def process_user_message(user_text: str) -> str:
@@ -303,27 +479,30 @@ def process_user_message(user_text: str) -> str:
     prompt = f"""
 {manager.get("system_prompt", "")}
 
+أنت (كريم) المدير العام ونقطة الاتصال الوحيدة مع أستاذ مصطفى. لا تجعل أي موظف آخر يرد مباشرة على أستاذ مصطفى؛ أنت تجمع عمل الفريق وترد باسم المكتب كله.
+
 الفريق الحالي في قاعدة البيانات:
 {json.dumps(agents_summary, ensure_ascii=False, indent=2)}
 
-رسالة المستخدم:
+رسالة أستاذ مصطفى:
 "{user_text}"
 
 حدد القرار المناسب وأعد JSON فقط بدون أي شرح خارجي بالشكل التالي:
 {{
-  "decision": "chat" أو "create_task" أو "hire_or_evolve",
+  "decision": "chat" أو "create_task" أو "hire_or_evolve" أو "build_tool",
   "task": {{
     "title": "عنوان المهمة إذا كان القرار create_task",
     "assigned_agent_code": "كود أنسب موظف من الفريق الحالي أو manager",
     "priority": "low أو normal أو high",
     "notes": "ملاحظات مختصرة"
   }},
-  "hr_instruction": "تعليمات للـ HR إذا كان القرار hire_or_evolve لتعيين موظف جديد أو تطوير موظف/أداة",
-  "reply": "الرد النهائي الواضح والمباشر للمستخدم بالعربية"
+  "hr_instruction": "تعليمات للـ HR إذا كان القرار hire_or_evolve",
+  "tool_instruction": "تعليمات لطارق (product_manager) إذا كان القرار build_tool",
+  "reply": "الرد النهائي الواضح والمباشر لأستاذ مصطفى بالعربية بصفتك كريم"
 }}
 """
     response = gemini_client.models.generate_content(
-        model=manager.get("model_name") or "gemini-3.5-flash-lite",
+        model=manager.get("model_name") or DEFAULT_MODEL,
         contents=prompt,
     )
     data = parse_json_response(response.text or "{}")
@@ -339,6 +518,8 @@ def process_user_message(user_text: str) -> str:
                 priority=task_info.get("priority") or "normal",
                 notes=task_info.get("notes") or "",
             )
+            team_outputs = execute_pending_tasks_for_team(agents, limit=2)
+            extra_notes.extend(team_outputs)
 
     elif decision == "hire_or_evolve" and hr:
         hr_instruction = (data.get("hr_instruction") or user_text).strip()
@@ -352,7 +533,13 @@ def process_user_message(user_text: str) -> str:
             elif r.get("ok") and "tool_code" in r:
                 extra_notes.append(f"تم ربط الأداة {r.get('tool_code')} بالموظف {r.get('agent_code')}")
 
-    reply_text = (data.get("reply") or "تم استلام رسالتك.").strip()
+    elif decision == "build_tool":
+        tool_instruction = (data.get("tool_instruction") or user_text).strip()
+        pm = next((a for a in agents if a["code"] == "product_manager"), None)
+        tool_notes = run_product_tool_builder(tool_instruction, (pm or {}).get("tools") or [])
+        extra_notes.extend(tool_notes)
+
+    reply_text = (data.get("reply") or "تم استلام رسالتك يا أستاذ مصطفى.").strip()
     if extra_notes:
         reply_text += "\n\n" + "\n".join(f"• {item}" for item in extra_notes)
     return reply_text
@@ -360,7 +547,7 @@ def process_user_message(user_text: str) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أهلاً بك! أنا كريم، والنظام شغال الآن بالمدير العام والـ HR من قاعدة البيانات مباشرة. أرسل توجيهاتك أو مهامك أو طلبات تطوير الفريق."
+        "أهلاً بك يا أستاذ مصطفى! أنا كريم، المدير العام ونقطة تواصلك الوحيدة مع المكتب الذكي. أرسل أوامرك ومهامك وأنا أنسّق مع الفريق بالكامل وأرد عليك بالخلاصة."
     )
 
 
