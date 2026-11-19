@@ -578,15 +578,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = update.message.text.strip()
-        chat_id = str(update.message.chat_id)
+    chat_id = str(update.message.chat_id)
+    try:
         history = get_chat_history(chat_id)
         save_message(chat_id, "user", user_text)
-    try:
         reply_text = process_user_message(user_text)
         save_message(chat_id, "assistant", reply_text)
     except Exception as e:
-        logging.error(f"Error in handle_message: {e}")
-        reply_text = "حصلت مشكلة أثناء تنفيذ القرار، تأكد من إعدادات المفاتيح في Render وجرّب مرة أخرى."
+        logging.error(f"Error in handle message: {e}")
+        reply_text = "حصلت مشكلة أثناء تنفيذ القرار، تأكد من إعدادات المفاتيح في Render"
 
     await update.message.reply_text(reply_text)
 
