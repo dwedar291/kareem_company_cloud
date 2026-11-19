@@ -18,7 +18,7 @@ from supabase import create_client, Client
 
 supabase: Client = create_client("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY")
 
-#def get_chat_history(chat_id: str, limit: int = 20):
+def get_chat_history(chat_id: str, limit: int = 20):
     res = (
         supabase.table("chat_messages")
         .select("role, content")
@@ -31,7 +31,7 @@ supabase: Client = create_client("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY")
     rows.reverse()  # ترتيب تصاعدي من الأقدم للأحدث
     return rows
 
-#def save_message(chat_id: str, role: str, content: str):
+def save_message(chat_id: str, role: str, content: str):
     supabase.table("chat_messages").insert({
         "chat_id": str(chat_id),
         "role": role,
