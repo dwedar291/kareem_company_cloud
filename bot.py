@@ -77,7 +77,7 @@ def get_active_agents_with_tools() -> list[dict]:
             "name": ag.get("name"),
             "role": ag.get("role"),
             "system_prompt": ag.get("system_prompt") or "",
-            "model_name": ag.get("model_name") or "gemini-2.5-flash",
+            "model_name": ag.get("model_name") or "gemini-3.0-flash",
             "can_hire": bool(ag.get("can_hire")),
             "can_evolve": bool(ag.get("can_evolve")),
             "version": ag.get("version") or 1,
@@ -126,7 +126,7 @@ def tool_hire_agent(
         "name": name.strip(),
         "role": role.strip(),
         "system_prompt": system_prompt.strip(),
-        "model_name": "gemini-2.5-flash",
+        "model_name": "gemini-3.0-flash",
         "can_hire": bool(can_hire),
         "can_evolve": bool(can_evolve),
         "is_active": True,
@@ -245,7 +245,7 @@ def run_hr_execution(hr_agent: dict, hr_instruction: str, available_tool_codes: 
 }}
 """
     res = gemini_client.models.generate_content(
-        model=hr_agent.get("model_name") or "gemini-2.5-flash",
+        model=hr_agent.get("model_name") or "gemini-3.0-flash",
         contents=prompt,
     )
     parsed = parse_json_response(res.text or "{}")
@@ -323,7 +323,7 @@ def process_user_message(user_text: str) -> str:
 }}
 """
     response = gemini_client.models.generate_content(
-        model=manager.get("model_name") or "gemini-2.5-flash",
+        model=manager.get("model_name") or "gemini-3.0-flash",
         contents=prompt,
     )
     data = parse_json_response(response.text or "{}")
