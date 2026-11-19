@@ -578,9 +578,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = update.message.text.strip()
-    chat_id = str(update.message.chat_id)
-history = get_chat_history(chat_id)
-save_message(chat_id, "user", user_text)
+        chat_id = str(update.message.chat_id)
+        history = get_chat_history(chat_id)
+        save_message(chat_id, "user", user_text)
     try:
         reply_text = process_user_message(user_text)
         save_message(chat_id, "assistant", reply_text)
