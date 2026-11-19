@@ -1,58 +1,62 @@
 import os
 import logging
 from telegram import Update
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from supabase import create_client, Client
 
 # إعدادات التسجيل لمتابعة الأخطاء
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 
-# بيانات الاتصال الخاصة بك
-TELEGRAM_TOKEN = "9166833763:AAGvM7gXmepGJwQPEXLYIag5MjuOPcof69s"
-SUPABASE_URL = "https://dxpizqltrwdtsheqmuan.supabase.co"
-SUPABASE_KEY = "Sb_secret_MCaLK2XKvrM0SmN86tXchg_Gw73H0C-"
+# جلب البيانات من متغيرات البيئة وتنظيف أي مسافات زائدة
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
+SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
+
+if not TELEGRAM_TOKEN or not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("تأكد من ضبط TELEGRAM_TOKEN و SUPABASE_URL و SUPABASE_KEY في Environment على Render")
 
 # تشغيل الاتصال بقاعدة البيانات
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# أمر البداية (لما تكلم كريم أول مرة)
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_name = update.effective_user.first_name
-    welcome_message = (
-        f"أهلاً بحضرتك يا باشمهندس {user_name}! 👔\n"
-        "أنا **كريم**، المدير العام لشركتك السحابية.\n"
-        "مستعد أدير الشغل، أوزع المهام، وأتابع مع فريق العمل من خلال تليجرام.\n\n"
-        "أمرني، إيه المهمة الأولى اللي تحب نبدأ بيها اليوم؟"
-    )
-    await update.message.reply_text(welcome_message, parse_mode="Markdown")
 
-# الرد على أي رسالة أو أمر توجيهي ترسله لكريم
+# أمر البداية (/start)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("أهلاً بك! أنا كريم، أرسل لي أي مهمة وسأسجلها مباشرة في جدول المهام.")
+
+
+# الرد على أي رسالة وتسجيلها في جدول tasks داخل Supabase
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    
-    # تسجيل المهمة مباشرة في قاعدة بيانات Supabase (جدول tasks)
+    if not update.message or not update.message.text:
+        return
+
+    user_text = update.message.text.strip()
+
     try:
         supabase.table("tasks").insert({
             "title": user_text,
-            "status": "pending"
+            "status": "pending",
         }).execute()
-        
-        reply_text = f"✅ يا فندم، استلمت التوجيه التالي وسجلته في جدول المهام:\n\"{user_text}\"\n\nجارِ دراسته وتوزيعه على الموظفين فوراً!"
+
+        reply_text = f"تم استلام التوجيه التالي وتسجيله في جدول المهام:\n{user_text}"
     except Exception as e:
         logging.error(f"Supabase error: {e}")
         reply_text = f"حصلت مشكلة في تسجيل المهمة: {e}"
-        await update.message.reply_text(reply_text)
 
-if __name__ == '__main__':
-    # بناء وتفعيل بوت تليجرام
+    await update.message.reply_text(reply_text)
+
+
+def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # ربط الأوامر والرسائل بالوظائف البرمجية
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🤖 نظام 'كريم' يعمل الآن وجاهز لاستقبال الأوامر عبر تليجرام...")
+    logging.info("Kareem bot is running...")
     app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
