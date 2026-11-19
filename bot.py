@@ -9,6 +9,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from supabase import create_client, Client
 from google import genai
+from google.genai import types
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -28,7 +29,7 @@ if not TELEGRAM_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or not GEMINI_API_
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
-sys_config = genai.types.GenerateContentConfig(
+sys_config = types.GenerateContentConfig(
     system_instruction=(
         "أنت مساعد ذكي، ودود، وبتتكلم بأسلوب طبيعي وبسيط زي البشر في الشات. "
         "جاوب مباشرة وبساطة من غير تكلف أو ألقاب رسمية مبالغ فيها، "
@@ -586,6 +587,21 @@ def process_user_message(user_text: str, chat_id: str | None = None) -> str:
     return reply_text
 
 
+async def analyze_media_with_gemini(
+    file_bytes: bytes,
+    mime_type: str,
+    prompt_text: str,
+    model_name: str = DEFAULT_MODEL,
+) -> str:
+    media_part = types.Part.from_bytes(data=file_bytes, mime_type=mime_type)
+    response = gemini_client.models.generate_content(
+        model=model_name,
+        contents=[media_part, prompt_text],
+        config=sys_config,
+    )
+    return (response.text or "").strip()
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "أهلاً بك! أنا كريم، جاهز أساعدك وأنسّق مع الفريق. قولّي محتاج إيه نبدأ بيه."
@@ -605,6 +621,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error in handle message: {e}")
         reply_text = "حصلت مشكلة أثناء تنفيذ القرار، تأكد من إعدادات المفاتيح في Render"
+
+    await update.message.reply_text(reply_text)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.photo:
+        return
+
+    chat_id = str(update.message.chat_id)
+    caption = (update.message.caption or "").strip()
+
+    try:
+        largest_photo = update.message.photo[-1]
+        tg_file = await context.bot.get_file(largest_photo.file_id)
+        photo_bytes = bytes(await tg_file.download_as_bytearray())
+
+        vision_prompt = (
+            f"المستخدم بعت الصورة دي وكتب معاها: '{caption}'. افحص الصورة بدقة واشرح محتواها بالعربية بوضوح."
+            if caption
+            else "المستخدم بعت الصورة دي بدون تعليق. افحص الصورة بدقة واشرح محتواها وأهم التفاصيل اللي فيها بالعربية."
+        )
+        photo_description = await analyze_media_with_gemini(
+            file_bytes=photo_bytes,
+            mime_type="image/jpeg",
+            prompt_text=vision_prompt,
+        )
+
+        combined_user_input = (
+            f"[أرسل المستخدم صورة] وصف/محتوى الصورة: {photo_description}"
+            + (f" | تعليق المستخدم: {caption}" if caption else "")
+        )
+
+        save_message(chat_id, "user", combined_user_input)
+        reply_text = process_user_message(combined_user_input, chat_id=chat_id)
+        save_message(chat_id, "assistant", reply_text)
+    except Exception as e:
+        logging.error(f"Error in handle_photo: {e}")
+        reply_text = "حصلت مشكلة وأنا بشوف الصورة، جرّب تبعتها تاني."
+
+    await update.message.reply_text(reply_text)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.voice:
+        return
+
+    chat_id = str(update.message.chat_id)
+
+    try:
+        tg_file = await context.bot.get_file(update.message.voice.file_id)
+        voice_bytes = bytes(await tg_file.download_as_bytearray())
+
+        voice_prompt = (
+            "اسمع الرسالة الصوتية دي كويس، فرّغ الكلام اللي فيها بدقة، "
+            "واكتب التفريغ النصي والملخص أو المقصود من الكلام بالعربية."
+        )
+        transcript_text = await analyze_media_with_gemini(
+            file_bytes=voice_bytes,
+            mime_type=update.message.voice.mime_type or "audio/ogg",
+            prompt_text=voice_prompt,
+        )
+
+        combined_user_input = f"[أرسل المستخدم رسالة صوتية]: {transcript_text}"
+
+        save_message(chat_id, "user", combined_user_input)
+        reply_text = process_user_message(combined_user_input, chat_id=chat_id)
+        save_message(chat_id, "assistant", reply_text)
+    except Exception as e:
+        logging.error(f"Error in handle_voice: {e}")
+        reply_text = "حصلت مشكلة وأنا بسمع الريكورد، جرّب تبعته تاني."
 
     await update.message.reply_text(reply_text)
 
@@ -641,6 +727,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     logging.info("Kareem office bot is running...")
     app.run_polling(drop_pending_updates=True)
