@@ -49,7 +49,9 @@ if not TELEGRAM_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or not GEMINI_API_
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-
+sys_config = genai.types.GenerateContentConfig(
+    system_instruction="أنت مساعد ذكي، ودود، وبتتكلم بأسلوب طبيعي ومباشر زي البشر. لو المستخدم سأل عن حاله رد بود وبساطة، وجاوب على أسئلته مباشرة من غير مقدمات رسمية."
+)
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -352,7 +354,7 @@ def run_product_tool_builder(instruction: str, available_tools: list[str]) -> li
 """
     res = gemini_client.models.generate_content(
         model=pm.get("model_name") or DEFAULT_MODEL,
-        contents=prompt,
+        contents=prompt,config=sys_config
     )
     parsed = parse_json_response(res.text or "{}")
     notes = []
