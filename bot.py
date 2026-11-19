@@ -42,8 +42,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         reply_text = f"✅ يا فندم، استلمت التوجيه التالي وسجلته في جدول المهام:\n\"{user_text}\"\n\nجارِ دراسته وتوزيعه على الموظفين فوراً!"
     except Exception as e:
-        reply_text = f"⚠️ حصلت مشكلة صغيرة في تسجيل المهمة بقاعدة البيانات، بس ولا يهمك يا باشا: {e}"
-
+    logging.error(f"Supabase error: {e}")
+    reply_text = f"حصلت مشكلة في تسجيل المهمة: {e}"
     await update.message.reply_text(reply_text)
 
 if __name__ == '__main__':
