@@ -14,29 +14,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-from supabase import create_client, Client
 
-supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
-
-def get_chat_history(chat_id: str, limit: int = 20):
-    res = (
-        supabase.table("chat_messages")
-        .select("role, content")
-        .eq("chat_id", str(chat_id))
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
-    )
-    rows = res.data or []
-    rows.reverse()  # ترتيب تصاعدي من الأقدم للأحدث
-    return rows
-
-def save_message(chat_id: str, role: str, content: str):
-    supabase.table("chat_messages").insert({
-        "chat_id": str(chat_id),
-        "role": role,
-        "content": content,
-    }).execute()
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
@@ -49,9 +27,37 @@ if not TELEGRAM_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or not GEMINI_API_
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
 sys_config = genai.types.GenerateContentConfig(
-    system_instruction="أنت مساعد ذكي، ودود، وبتتكلم بأسلوب طبيعي ومباشر زي البشر. لو المستخدم سأل عن حاله رد بود وبساطة، وجاوب على أسئلته مباشرة من غير مقدمات رسمية."
+    system_instruction=(
+        "أنت مساعد ذكي، ودود، وبتتكلم بأسلوب طبيعي وبسيط زي البشر في الشات. "
+        "جاوب مباشرة وبساطة من غير تكلف أو ألقاب رسمية مبالغ فيها، "
+        "ولو حد سألك عامل إيه رد عادي وبود."
+    )
 )
+
+
+def get_chat_history(chat_id: str, limit: int = 20):
+    res = (
+        supabase.table("chat_messages")
+        .select("role, content")
+        .eq("chat_id", str(chat_id))
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    rows = res.data or []
+    rows.reverse()
+    return rows
+
+
+def save_message(chat_id: str, role: str, content: str):
+    supabase.table("chat_messages").insert({
+        "chat_id": str(chat_id),
+        "role": role,
+        "content": content,
+    }).execute()
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -354,7 +360,8 @@ def run_product_tool_builder(instruction: str, available_tools: list[str]) -> li
 """
     res = gemini_client.models.generate_content(
         model=pm.get("model_name") or DEFAULT_MODEL,
-        contents=prompt,config=sys_config
+        contents=prompt,
+        config=sys_config,
     )
     parsed = parse_json_response(res.text or "{}")
     notes = []
@@ -377,10 +384,10 @@ def run_hr_execution(hr_agent: dict, hr_instruction: str, available_tool_codes: 
     prompt = f"""
 {hr_agent.get("system_prompt", "")}
 
-أنت تنفذ طلباً صادراً من المدير العام لتطوير الفريق أو الأدوات تلقائياً.
+أنت تنفذ طلباً لتطوير الفريق أو الأدوات تلقائياً.
 الأدوات المتاحة لك حالياً: {json.dumps(available_tool_codes, ensure_ascii=False)}
 
-الطلب من المدير:
+الطلب:
 "{hr_instruction}"
 
 أعد JSON فقط بدون أي نص خارجه بالشكل التالي:
@@ -405,6 +412,7 @@ def run_hr_execution(hr_agent: dict, hr_instruction: str, available_tool_codes: 
     res = gemini_client.models.generate_content(
         model=hr_agent.get("model_name") or DEFAULT_MODEL,
         contents=prompt,
+        config=sys_config,
     )
     parsed = parse_json_response(res.text or "{}")
     results = []
@@ -417,7 +425,7 @@ def run_hr_execution(hr_agent: dict, hr_instruction: str, available_tool_codes: 
                 code=act.get("code") or "specialist_agent",
                 name=act.get("name") or "موظف متخصص",
                 role=act.get("role") or "متابعة المهام المتخصصة",
-                system_prompt=act.get("system_prompt") or "أنت موظف متخصص تنفذ المهام المسندة إليك بدقة وتقدم تقريرك للمدير العام.",
+                system_prompt=act.get("system_prompt") or "أنت موظف متخصص تنفذ المهام المسندة إليك بدقة وتقدم تقريرك.",
                 tool_codes=act.get("tools") or ["create_task"],
             )
             results.append(r)
@@ -445,190 +453,4 @@ def execute_pending_tasks_for_team(agents: list[dict], limit: int = 3) -> list[s
     pending_res = (
         supabase.table("tasks")
         .select("*")
-        .eq("status", "pending")
-        .order("id", desc=False)
-        .limit(limit)
-        .execute()
-    )
-    pending_tasks = pending_res.data or []
-    summaries = []
-
-    for task in pending_tasks:
-        target_code = task.get("assigned_agent_code") or ""
-        worker = agents_by_code.get(target_code)
-        if not worker:
-            continue
-
-        prompt = f"""
-{worker.get("system_prompt", "")}
-
-مهمة مسندة إليك من المدير العام (كريم):
-العنوان: {task.get("title")}
-الملاحظات: {task.get("notes") or ""}
-
-نفّذ المهمة بأفضل صورة عملية ومختصرة واكتب النتيجة النهائية ليقوم كريم برفعها لأستاذ مصطفى.
-"""
-        res = gemini_client.models.generate_content(
-            model=worker.get("model_name") or DEFAULT_MODEL,
-            contents=prompt,
-        )
-        output_text = (res.text or "تم الإنجاز.").strip()
-        supabase.table("tasks").update({
-            "status": "completed",
-            "notes": f"{task.get('notes') or ''}\n[نتيجة {worker.get('name')}]: {output_text}".strip(),
-        }).eq("id", task["id"]).execute()
-        summaries.append(f"{worker.get('name')} ({worker.get('role')}): {output_text}")
-
-    return summaries
-
-
-def process_user_message(user_text: str) -> str:
-    agents = get_active_agents_with_tools()
-    manager = next((a for a in agents if a["code"] == "manager"), None)
-    hr = next((a for a in agents if a["code"] == "hr"), None)
-
-    if not manager:
-        return "تنبيه: وكيل المدير (manager) غير مفعل في قاعدة البيانات حالياً."
-
-    agents_summary = [
-        {
-            "code": a["code"],
-            "name": a["name"],
-            "role": a["role"],
-            "tools": a["tools"],
-        }
-        for a in agents
-    ]
-
-    prompt = f"""
-{manager.get("system_prompt", "")}
-
-أنت (كريم) المدير العام ونقطة الاتصال الوحيدة مع أستاذ مصطفى. لا تجعل أي موظف آخر يرد مباشرة على أستاذ مصطفى؛ أنت تجمع عمل الفريق وترد باسم المكتب كله.
-
-الفريق الحالي في قاعدة البيانات:
-{json.dumps(agents_summary, ensure_ascii=False, indent=2)}
-
-رسالة أستاذ مصطفى:
-"{user_text}"
-
-حدد القرار المناسب وأعد JSON فقط بدون أي شرح خارجي بالشكل التالي:
-{{
-  "decision": "chat" أو "create_task" أو "hire_or_evolve" أو "build_tool",
-  "task": {{
-    "title": "عنوان المهمة إذا كان القرار create_task",
-    "assigned_agent_code": "كود أنسب موظف من الفريق الحالي أو manager",
-    "priority": "low أو normal أو high",
-    "notes": "ملاحظات مختصرة"
-  }},
-  "hr_instruction": "تعليمات للـ HR إذا كان القرار hire_or_evolve",
-  "tool_instruction": "تعليمات لطارق (product_manager) إذا كان القرار build_tool",
-  "reply": "الرد النهائي الواضح والمباشر لأستاذ مصطفى بالعربية بصفتك كريم"
-}}
-"""
-    response = gemini_client.models.generate_content(
-        model=manager.get("model_name") or DEFAULT_MODEL,
-        contents=prompt,
-    )
-    data = parse_json_response(response.text or "{}")
-    decision = (data.get("decision") or "chat").strip()
-    extra_notes = []
-
-    if decision == "create_task" and "create_task" in manager.get("tools", []):
-        task_info = data.get("task") or {}
-        if task_info.get("title"):
-            tool_create_task(
-                title=task_info["title"],
-                assigned_agent_code=task_info.get("assigned_agent_code") or "manager",
-                priority=task_info.get("priority") or "normal",
-                notes=task_info.get("notes") or "",
-            )
-            team_outputs = execute_pending_tasks_for_team(agents, limit=2)
-            extra_notes.extend(team_outputs)
-
-    elif decision == "hire_or_evolve" and hr:
-        hr_instruction = (data.get("hr_instruction") or user_text).strip()
-        hr_results = run_hr_execution(hr, hr_instruction, hr.get("tools") or [])
-        for r in hr_results:
-            if r.get("ok") and "agent" in r and "assigned_tools" in r:
-                ag_new = r["agent"]
-                extra_notes.append(f"تم تعيين موظف جديد: {ag_new.get('name')} ({ag_new.get('code')})")
-            elif r.get("ok") and "version" in r:
-                extra_notes.append(f"تم تحديث تعليمات الموظف إلى النسخة v{r.get('version')}")
-            elif r.get("ok") and "tool_code" in r:
-                extra_notes.append(f"تم ربط الأداة {r.get('tool_code')} بالموظف {r.get('agent_code')}")
-
-    elif decision == "build_tool":
-        tool_instruction = (data.get("tool_instruction") or user_text).strip()
-        pm = next((a for a in agents if a["code"] == "product_manager"), None)
-        tool_notes = run_product_tool_builder(tool_instruction, (pm or {}).get("tools") or [])
-        extra_notes.extend(tool_notes)
-
-    reply_text = (data.get("reply") or "تم استلام رسالتك يا أستاذ مصطفى.").strip()
-    if extra_notes:
-        reply_text += "\n\n" + "\n".join(f"• {item}" for item in extra_notes)
-    return reply_text
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "أهلاً بك يا أستاذ مصطفى! أنا كريم، المدير العام ونقطة تواصلك الوحيدة مع المكتب الذكي. أرسل أوامرك ومهامك وأنا أنسّق مع الفريق بالكامل وأرد عليك بالخلاصة."
-    )
-
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    user_text = update.message.text.strip()
-    chat_id = str(update.message.chat_id)
-    try:
-        history = get_chat_history(chat_id)
-        save_message(chat_id, "user", user_text)
-        reply_text = process_user_message(user_text)
-        save_message(chat_id, "assistant", reply_text)
-    except Exception as e:
-        logging.error(f"Error in handle message: {e}")
-        reply_text = "حصلت مشكلة أثناء تنفيذ القرار، تأكد من إعدادات المفاتيح في Render"
-
-    await update.message.reply_text(reply_text)
-
-
-def main():
-    start_health_server()
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logging.info("Kareem office bot is running...")
-    app.run_polling()
-import urllib.request
-
-
-def execute_tool_from_config(tool_code: str) -> str:
-    res = supabase.table("tools").select("config").eq("code", tool_code).execute()
-    data = res.data
-    if not data:
-        return f"الأداة {tool_code} غير موجودة."
-
-    config = data[0].get("config", {})
-    script_url = config.get("script_url")
-    dev_token = config.get("developer_token")
-
-    if script_url:
-        try:
-            req = urllib.request.Request(
-                script_url, headers={"User-Agent": "KareemOfficeBot/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=15) as response:
-                return response.read().decode("utf-8", errors="replace")
-        except Exception as e:
-            return f"خطأ في الاتصال بالرابط: {e}"
-
-    elif dev_token:
-        return f"مفتاح الإعلانات جاهز، بانتظار ربط مسار التحليل. التوكن: {dev_token[:5]}..."
-
-    return "لم يتم العثور على رابط أو توكن صالح في الإعدادات."
-
-if __name__ == "__main__":
-    main()
+        .eq("status",
