@@ -14,7 +14,29 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+from supabase import create_client, Client
 
+supabase: Client = create_client("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY")
+
+def get_chat_history(chat_id: str, limit: int = 20):
+    res = (
+        supabase.table("chat_messages")
+        .select("role, content")
+        .eq("chat_id", str(chat_id))
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    rows = res.data or []
+    rows.reverse()  # ترتيب تصاعدي من الأقدم للأحدث
+    return rows
+
+def save_message(chat_id: str, role: str, content: str):
+    supabase.table("chat_messages").insert({
+        "chat_id": str(chat_id),
+        "role": role,
+        "content": content,
+    }).execute()
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
@@ -556,8 +578,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = update.message.text.strip()
+    chat_id = str(update.message.chat_id)
+history = get_chat_history(chat_id)
+save_message(chat_id, "user", user_text)
     try:
         reply_text = process_user_message(user_text)
+        save_message(chat_id, "assistant", reply_text)
     except Exception as e:
         logging.error(f"Error in handle_message: {e}")
         reply_text = "حصلت مشكلة أثناء تنفيذ القرار، تأكد من إعدادات المفاتيح في Render وجرّب مرة أخرى."
