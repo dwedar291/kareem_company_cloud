@@ -106,20 +106,6 @@ def tool_create_task(title: str, assigned_agent_code: str = "manager", priority:
     return {"ok": True, "task": (res.data or [{}])[0]}
 
 
-def tool_list_agents() -> list[dict]:
-    agents = get_active_agents_with_tools()
-    return [
-        {
-            "code": a["code"],
-            "name": a["name"],
-            "role": a["role"],
-            "version": a["version"],
-            "tools": a["tools"],
-        }
-        for a in agents
-    ]
-
-
 def tool_hire_agent(
     actor_code: str,
     code: str,
@@ -344,4 +330,64 @@ def process_user_message(user_text: str) -> str:
     decision = (data.get("decision") or "chat").strip()
     extra_notes = []
 
-    if
+    if decision == "create_task" and "create_task" in manager.get("tools", []):
+        task_info = data.get("task") or {}
+        if task_info.get("title"):
+            tool_create_task(
+                title=task_info["title"],
+                assigned_agent_code=task_info.get("assigned_agent_code") or "manager",
+                priority=task_info.get("priority") or "normal",
+                notes=task_info.get("notes") or "",
+            )
+
+    elif decision == "hire_or_evolve" and hr:
+        hr_instruction = (data.get("hr_instruction") or user_text).strip()
+        hr_results = run_hr_execution(hr, hr_instruction, hr.get("tools") or [])
+        for r in hr_results:
+            if r.get("ok") and "agent" in r and "assigned_tools" in r:
+                ag_new = r["agent"]
+                extra_notes.append(f"تم تعيين موظف جديد: {ag_new.get('name')} ({ag_new.get('code')})")
+            elif r.get("ok") and "version" in r:
+                extra_notes.append(f"تم تحديث تعليمات الموظف إلى النسخة v{r.get('version')}")
+            elif r.get("ok") and "tool_code" in r:
+                extra_notes.append(f"تم ربط الأداة {r.get('tool_code')} بالموظف {r.get('agent_code')}")
+
+    reply_text = (data.get("reply") or "تم استلام رسالتك.").strip()
+    if extra_notes:
+        reply_text += "\n\n" + "\n".join(f"• {item}" for item in extra_notes)
+    return reply_text
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "أهلاً بك! أنا كريم، والنظام شغال الآن بالمدير العام والـ HR من قاعدة البيانات مباشرة. أرسل توجيهاتك أو مهامك أو طلبات تطوير الفريق."
+    )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    user_text = update.message.text.strip()
+    try:
+        reply_text = process_user_message(user_text)
+    except Exception as e:
+        logging.error(f"Error in handle_message: {e}")
+        reply_text = "حصلت مشكلة أثناء تنفيذ القرار، تأكد من إعدادات المفاتيح في Render وجرّب مرة أخرى."
+
+    await update.message.reply_text(reply_text)
+
+
+def main():
+    start_health_server()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logging.info("Kareem office bot is running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
