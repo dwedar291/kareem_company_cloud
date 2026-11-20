@@ -93,12 +93,14 @@ def parse_json_response(text: str) -> dict:
     return json.loads(raw)
 
 
-def get_active_agents_with_tools() -> list[dict]:
+def get_active_agents_with_tools() -> tuple[list[dict], dict[str, dict]]:
     agents_res = supabase.table("agents").select("*").eq("is_active", True).execute()
     agents = agents_res.data or []
 
     tools_res = supabase.table("tools").select("*").eq("is_enabled", True).execute()
-    tools_by_id = {t["id"]: t for t in (tools_res.data or [])}
+    tools_rows = tools_res.data or []
+    tools_by_id = {t["id"]: t for t in tools_rows}
+    tools_by_code = {t["code"]: t for t in tools_rows if t.get("code")}
 
     links_res = supabase.table("agent_tools").select("*").execute()
     links = links_res.data or []
@@ -106,7 +108,7 @@ def get_active_agents_with_tools() -> list[dict]:
     agent_tool_codes: dict[str, list[str]] = {}
     for link in links:
         tool = tools_by_id.get(link.get("tool_id"))
-        if tool:
+        if tool and tool.get("code"):
             agent_tool_codes.setdefault(link["agent_id"], []).append(tool["code"])
 
     enriched = []
@@ -123,7 +125,7 @@ def get_active_agents_with_tools() -> list[dict]:
             "version": ag.get("version") or 1,
             "tools": agent_tool_codes.get(ag.get("id"), []),
         })
-    return enriched
+    return enriched, tools_by_code
 
 
 def log_evolution(actor_code: str, action_type: str, target_code: str, details: dict):
@@ -146,7 +148,13 @@ def tool_create_task(title: str, assigned_agent_code: str = "manager", priority:
     return {"ok": True, "task": (res.data or [{}])[0]}
 
 
-def tool_http_request(method: str, url: str, params: dict | None = None, body: dict | None = None) -> dict:
+def tool_http_request(
+    method: str,
+    url: str,
+    params: dict | None = None,
+    body: dict | None = None,
+    extra_headers: dict | None = None,
+) -> dict:
     clean_method = (method or "GET").upper().strip()
     clean_url = (url or "").strip()
     if not clean_url.startswith(("http://", "https://")):
@@ -158,14 +166,63 @@ def tool_http_request(method: str, url: str, params: dict | None = None, body: d
 
     data_bytes = None
     headers = {"User-Agent": "KareemOfficeBot/1.0"}
+    if extra_headers and isinstance(extra_headers, dict):
+        for k, v in extra_headers.items():
+            if k and v is not None:
+                headers[str(k)] = str(v)
+
     if clean_method in ("POST", "PUT", "PATCH") and body is not None:
         data_bytes = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
+        headers.setdefault("Content-Type", "application/json")
 
     req = urllib.request.Request(clean_url, data=data_bytes, headers=headers, method=clean_method)
     with urllib.request.urlopen(req, timeout=15) as resp:
         raw_body = resp.read().decode("utf-8", errors="replace")
-        return {"ok": True, "status": resp.status, "response": raw_body[:2000]}
+        return {"ok": True, "status": resp.status, "response": raw_body[:2500]}
+
+
+def run_configured_tool(tool_row: dict, task: dict) -> str:
+    tool_code = tool_row.get("code") or "tool"
+    config = tool_row.get("config") or {}
+    if not isinstance(config, dict):
+        config = {}
+
+    target_url = (config.get("script_url") or config.get("url") or config.get("endpoint") or "").strip()
+    method = (config.get("method") or ("POST" if config.get("body") else "GET")).upper().strip()
+    extra_headers = config.get("headers") if isinstance(config.get("headers"), dict) else None
+
+    params = dict(config.get("params") or {}) if isinstance(config.get("params"), dict) else {}
+    if task.get("title"):
+        params.setdefault("task_title", task.get("title"))
+    if task.get("notes"):
+        params.setdefault("task_notes", task.get("notes"))
+
+    body = None
+    if method in ("POST", "PUT", "PATCH"):
+        body = dict(config.get("body") or {}) if isinstance(config.get("body"), dict) else {}
+        body.setdefault("task_title", task.get("title"))
+        body.setdefault("task_notes", task.get("notes"))
+
+    if target_url:
+        try:
+            res = tool_http_request(
+                method=method,
+                url=target_url,
+                params=params if method == "GET" else None,
+                body=body if method != "GET" else None,
+                extra_headers=extra_headers,
+            )
+            if res.get("ok"):
+                return f"[{tool_code}] (HTTP {res.get('status')}): {res.get('response')}"
+            return f"[{tool_code}] فشل التنفيذ: {res.get('error')}"
+        except Exception as e:
+            return f"[{tool_code}] خطأ أثناء الاتصال بالرابط ({target_url}): {e}"
+
+    if config.get("developer_token"):
+        token_preview = str(config.get("developer_token"))[:5]
+        return f"[{tool_code}] يوجد developer_token ({token_preview}...) لكن لا يوجد رابط تنفيذ (url / script_url) مضبوط في إعدادات الأداة."
+
+    return f"[{tool_code}] الأداة مسجلة لكن إعداداتها (config) لا تحتوي على رابط تنفيذ (url أو script_url) بعد."
 
 
 def tool_register_tool(
@@ -180,6 +237,8 @@ def tool_register_tool(
     if not clean_code:
         return {"ok": False, "error": "كود الأداة مطلوب"}
 
+    clean_config = config or {"type": "http", "method": "GET", "url": ""}
+
     existing = supabase.table("tools").select("id, code").eq("code", clean_code).execute().data or []
     if existing:
         tool_id = existing[0]["id"]
@@ -187,7 +246,7 @@ def tool_register_tool(
             "name": name.strip(),
             "description": description.strip(),
             "is_enabled": True,
-            "config": config or {"type": "http"},
+            "config": clean_config,
         }).eq("id", tool_id).execute()
     else:
         inserted = supabase.table("tools").insert({
@@ -195,7 +254,7 @@ def tool_register_tool(
             "name": name.strip(),
             "description": description.strip(),
             "is_enabled": True,
-            "config": config or {"type": "http"},
+            "config": clean_config,
         }).execute()
         tool_id = (inserted.data or [{}])[0].get("id")
 
@@ -219,7 +278,7 @@ def tool_register_tool(
         actor_code=actor_code,
         action_type="register_tool",
         target_code=clean_code,
-        details={"name": name, "assigned_to": target_ag_code},
+        details={"name": name, "assigned_to": target_ag_code, "config": clean_config},
     )
     return {"ok": True, "tool_code": clean_code, "assigned_to": target_ag_code}
 
@@ -334,7 +393,7 @@ def tool_assign_tool(actor_code: str, target_agent_code: str, tool_code: str) ->
 
 
 def run_product_tool_builder(instruction: str, available_tools: list[str]) -> list[str]:
-    pm_agents = get_active_agents_with_tools()
+    pm_agents, _ = get_active_agents_with_tools()
     pm = next((a for a in pm_agents if a["code"] == "product_manager"), None)
     if not pm:
         return []
@@ -353,7 +412,7 @@ def run_product_tool_builder(instruction: str, available_tools: list[str]) -> li
       "name": "اسم الأداة",
       "description": "وصف الأداة وطريقة استخدامها",
       "assign_to_agent_code": "كود الموظف المستفيد مثل calendar_assistant أو media_analyst أو manager",
-      "config": {{"type": "http", "endpoint_hint": ""}}
+      "config": {{"type": "http", "method": "GET", "url": ""}}
     }}
   ],
   "summary": "ملخص مختصر"
@@ -374,7 +433,7 @@ def run_product_tool_builder(instruction: str, available_tools: list[str]) -> li
                 name=item["name"],
                 description=item.get("description") or item["name"],
                 assign_to_agent_code=item.get("assign_to_agent_code") or "manager",
-                config=item.get("config") or {"type": "http"},
+                config=item.get("config") or {"type": "http", "method": "GET", "url": ""},
             )
             if r.get("ok"):
                 notes.append(f"طارق سجّل أداة جديدة: {r['tool_code']} وربطها بـ {r['assigned_to']}")
@@ -449,7 +508,11 @@ def run_hr_execution(hr_agent: dict, hr_instruction: str, available_tool_codes: 
     return results
 
 
-def execute_pending_tasks_for_team(agents: list[dict], limit: int = 3) -> list[str]:
+def execute_pending_tasks_for_team(
+    agents: list[dict],
+    tools_by_code: dict[str, dict],
+    limit: int = 3,
+) -> list[str]:
     agents_by_code = {a["code"]: a for a in agents if a.get("code") != "manager"}
     pending_res = (
         supabase.table("tasks")
@@ -468,6 +531,16 @@ def execute_pending_tasks_for_team(agents: list[dict], limit: int = 3) -> list[s
         if not worker:
             continue
 
+        tool_outputs = []
+        for t_code in worker.get("tools") or []:
+            if t_code == "create_task":
+                continue
+            tool_row = tools_by_code.get(t_code)
+            if tool_row:
+                tool_outputs.append(run_configured_tool(tool_row, task))
+
+        tools_context = "\n".join(tool_outputs) if tool_outputs else "لا توجد نتائج أدوات خارجية لهذه المهمة."
+
         prompt = f"""
 {worker.get("system_prompt", "")}
 
@@ -475,7 +548,10 @@ def execute_pending_tasks_for_team(agents: list[dict], limit: int = 3) -> list[s
 العنوان: {task.get("title")}
 الملاحظات: {task.get("notes") or ""}
 
-نفّذ المهمة بأفضل صورة عملية ومختصرة واكتب النتيجة النهائية.
+نتائج تنفيذ الأدوات المرتبطة بك:
+{tools_context}
+
+نفّذ المهمة بأفضل صورة عملية ومختصرة واكتب النتيجة النهائية بناءً على البيانات الفعلية بالأعلى، ولو في أداة ناقصها إعداد وضح ذلك بوضوح.
 """
         res = gemini_client.models.generate_content(
             model=worker.get("model_name") or DEFAULT_MODEL,
@@ -493,7 +569,7 @@ def execute_pending_tasks_for_team(agents: list[dict], limit: int = 3) -> list[s
 
 
 def process_user_message(user_text: str, chat_id: str | None = None) -> str:
-    agents = get_active_agents_with_tools()
+    agents, tools_by_code = get_active_agents_with_tools()
     manager = next((a for a in agents if a["code"] == "manager"), None)
     hr = next((a for a in agents if a["code"] == "hr"), None)
 
@@ -560,7 +636,8 @@ def process_user_message(user_text: str, chat_id: str | None = None) -> str:
                 priority=task_info.get("priority") or "normal",
                 notes=task_info.get("notes") or "",
             )
-            team_outputs = execute_pending_tasks_for_team(agents, limit=2)
+            updated_agents, updated_tools_by_code = get_active_agents_with_tools()
+            team_outputs = execute_pending_tasks_for_team(updated_agents, updated_tools_by_code, limit=2)
             extra_notes.extend(team_outputs)
 
     elif decision == "hire_or_evolve" and hr:
@@ -693,32 +770,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_text = "حصلت مشكلة وأنا بسمع الريكورد، جرّب تبعته تاني."
 
     await update.message.reply_text(reply_text)
-
-
-def execute_tool_from_config(tool_code: str) -> str:
-    res = supabase.table("tools").select("config").eq("code", tool_code).execute()
-    data = res.data
-    if not data:
-        return f"الأداة {tool_code} غير موجودة."
-
-    config = data[0].get("config") or {}
-    script_url = config.get("script_url")
-    dev_token = config.get("developer_token")
-
-    if script_url:
-        try:
-            req = urllib.request.Request(
-                script_url, headers={"User-Agent": "KareemOfficeBot/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=15) as response:
-                return response.read().decode("utf-8", errors="replace")
-        except Exception as e:
-            return f"خطأ في الاتصال بالرابط: {e}"
-
-    elif dev_token:
-        return f"مفتاح الإعلانات جاهز، بانتظار ربط مسار التحليل. التوكن: {dev_token[:5]}..."
-
-    return "لم يتم العثور على رابط أو توكن صالح في الإعدادات."
 
 
 def main():
