@@ -17,11 +17,13 @@ logging.basicConfig(
 )
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
+KARIM_ID = "380ebfbd-0c61-464e-8ff7-a1380bef8b03"
 
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+KARIM_AGENT_ID = (os.getenv("KARIM_AGENT_ID") or KARIM_ID).strip()
 
 if not TELEGRAM_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or not GEMINI_API_KEY:
     raise ValueError("تأكد من ضبط TELEGRAM_TOKEN و SUPABASE_URL و SUPABASE_KEY و GEMINI_API_KEY في Render")
@@ -31,7 +33,7 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 sys_config = types.GenerateContentConfig(
     system_instruction=(
-        "أنت مساعد ذكي، ودود، وبتتكلم بأسلوب طبيعي وبسيط زي البشر في الشات. "
+        "أنت كريم، مساعد ذكي، ودود، وبتتكلم بأسلوب طبيعي وبسيط زي البشر في الشات. "
         "جاوب مباشرة وبساطة من غير تكلف أو ألقاب رسمية مبالغ فيها، "
         "ولو حد سألك عامل إيه رد عادي وبود."
     )
@@ -93,6 +95,18 @@ def parse_json_response(text: str) -> dict:
     return json.loads(raw)
 
 
+def resolve_karim_agent(agents: list[dict]) -> dict | None:
+    if not agents:
+        return None
+    by_id = next((a for a in agents if str(a.get("id")) == KARIM_AGENT_ID), None)
+    if by_id:
+        return by_id
+    by_code = next((a for a in agents if (a.get("code") or "").lower() in ("kareem", "karim", "manager")), None)
+    if by_code:
+        return by_code
+    return agents[0]
+
+
 def get_active_agents_with_tools() -> tuple[list[dict], dict[str, dict]]:
     agents_res = supabase.table("agents").select("*").eq("is_active", True).execute()
     agents = agents_res.data or []
@@ -102,7 +116,7 @@ def get_active_agents_with_tools() -> tuple[list[dict], dict[str, dict]]:
     tools_by_id = {t["id"]: t for t in tools_rows}
     tools_by_code = {t["code"]: t for t in tools_rows if t.get("code")}
 
-    links_res = supabase.table("agent_tools").select("*").execute()
+    links_res = supabase.table("agent_tools").select("*").eq("agent_id", KARIM_AGENT_ID).execute()
     links = links_res.data or []
 
     agent_tool_codes: dict[str, list[str]] = {}
@@ -113,18 +127,34 @@ def get_active_agents_with_tools() -> tuple[list[dict], dict[str, dict]]:
 
     enriched = []
     for ag in agents:
+        ag_id = ag.get("id")
         enriched.append({
-            "id": ag.get("id"),
-            "code": ag.get("code"),
-            "name": ag.get("name"),
-            "role": ag.get("role"),
+            "id": ag_id,
+            "code": ag.get("code") or "karim",
+            "name": ag.get("name") or "كريم",
+            "role": ag.get("role") or "المساعد الشخصي",
             "system_prompt": ag.get("system_prompt") or "",
             "model_name": ag.get("model_name") or DEFAULT_MODEL,
             "can_hire": bool(ag.get("can_hire")),
             "can_evolve": bool(ag.get("can_evolve")),
             "version": ag.get("version") or 1,
-            "tools": agent_tool_codes.get(ag.get("id"), []),
+            "tools": agent_tool_codes.get(ag_id, []),
         })
+
+    if not enriched:
+        enriched.append({
+            "id": KARIM_AGENT_ID,
+            "code": "karim",
+            "name": "كريم",
+            "role": "المساعد الشخصي",
+            "system_prompt": "",
+            "model_name": DEFAULT_MODEL,
+            "can_hire": False,
+            "can_evolve": False,
+            "version": 1,
+            "tools": [t["code"] for t in tools_rows if t.get("code")],
+        })
+
     return enriched, tools_by_code
 
 
@@ -137,11 +167,11 @@ def log_evolution(actor_code: str, action_type: str, target_code: str, details: 
     }).execute()
 
 
-def tool_create_task(title: str, assigned_agent_code: str = "manager", priority: str = "normal", notes: str = "") -> dict:
+def tool_create_task(title: str, assigned_agent_code: str = "karim", priority: str = "normal", notes: str = "") -> dict:
     res = supabase.table("tasks").insert({
         "title": title.strip(),
         "status": "pending",
-        "assigned_agent_code": (assigned_agent_code or "manager").strip(),
+        "assigned_agent_code": (assigned_agent_code or "karim").strip(),
         "priority": (priority or "normal").strip(),
         "notes": (notes or "").strip(),
     }).execute()
@@ -165,7 +195,7 @@ def tool_http_request(
         clean_url = f"{clean_url}{sep}{urllib.parse.urlencode(params)}"
 
     data_bytes = None
-    headers = {"User-Agent": "KareemOfficeBot/1.0"}
+    headers = {"User-Agent": "KareemBot/1.0"}
     if extra_headers and isinstance(extra_headers, dict):
         for k, v in extra_headers.items():
             if k and v is not None:
@@ -230,14 +260,13 @@ def tool_register_tool(
     code: str,
     name: str,
     description: str,
-    assign_to_agent_code: str = "manager",
     config: dict | None = None,
 ) -> dict:
     clean_code = (code or "").strip().lower().replace(" ", "_")
     if not clean_code:
         return {"ok": False, "error": "كود الأداة مطلوب"}
 
-    clean_config = config or {"type": "http", "method": "GET", "url": ""}
+    clean_config = config or {"type": "http", "method": "POST", "url": ""}
 
     existing = supabase.table("tools").select("id, code").eq("code", clean_code).execute().data or []
     if existing:
@@ -258,262 +287,29 @@ def tool_register_tool(
         }).execute()
         tool_id = (inserted.data or [{}])[0].get("id")
 
-    target_ag_code = (assign_to_agent_code or "manager").strip()
-    ag_rows = supabase.table("agents").select("id, code").eq("code", target_ag_code).execute().data or []
-    if tool_id and ag_rows:
-        ag_id = ag_rows[0]["id"]
+    if tool_id:
         links = (
             supabase.table("agent_tools")
             .select("id")
-            .eq("agent_id", ag_id)
+            .eq("agent_id", KARIM_AGENT_ID)
             .eq("tool_id", tool_id)
             .execute()
             .data
             or []
         )
         if not links:
-            supabase.table("agent_tools").insert({"agent_id": ag_id, "tool_id": tool_id}).execute()
+            supabase.table("agent_tools").insert({"agent_id": KARIM_AGENT_ID, "tool_id": tool_id}).execute()
 
     log_evolution(
         actor_code=actor_code,
         action_type="register_tool",
         target_code=clean_code,
-        details={"name": name, "assigned_to": target_ag_code, "config": clean_config},
+        details={"name": name, "assigned_to_agent_id": KARIM_AGENT_ID, "config": clean_config},
     )
-    return {"ok": True, "tool_code": clean_code, "assigned_to": target_ag_code}
+    return {"ok": True, "tool_code": clean_code, "assigned_to": "karim"}
 
 
-def tool_hire_agent(
-    actor_code: str,
-    code: str,
-    name: str,
-    role: str,
-    system_prompt: str,
-    tool_codes: list[str] | None = None,
-    can_hire: bool = False,
-    can_evolve: bool = False,
-) -> dict:
-    clean_code = code.strip().lower().replace(" ", "_")
-    existing = supabase.table("agents").select("id, code").eq("code", clean_code).execute().data or []
-    if existing:
-        return {"ok": False, "error": f"الموظف {clean_code} موجود بالفعل"}
-
-    inserted = supabase.table("agents").insert({
-        "code": clean_code,
-        "name": name.strip(),
-        "role": role.strip(),
-        "system_prompt": system_prompt.strip(),
-        "model_name": DEFAULT_MODEL,
-        "can_hire": bool(can_hire),
-        "can_evolve": bool(can_evolve),
-        "is_active": True,
-        "version": 1,
-        "created_by": actor_code,
-    }).execute()
-
-    new_agent = (inserted.data or [{}])[0]
-    new_agent_id = new_agent.get("id")
-
-    assigned_tools = []
-    if new_agent_id and tool_codes:
-        valid_tools = supabase.table("tools").select("id, code").in_("code", tool_codes).eq("is_enabled", True).execute().data or []
-        for vt in valid_tools:
-            supabase.table("agent_tools").insert({
-                "agent_id": new_agent_id,
-                "tool_id": vt["id"],
-            }).execute()
-            assigned_tools.append(vt["code"])
-
-    log_evolution(
-        actor_code=actor_code,
-        action_type="hire_agent",
-        target_code=clean_code,
-        details={"name": name, "role": role, "tools": assigned_tools},
-    )
-    return {"ok": True, "agent": new_agent, "assigned_tools": assigned_tools}
-
-
-def tool_update_agent_prompt(actor_code: str, target_code: str, new_system_prompt: str, reason: str = "") -> dict:
-    rows = supabase.table("agents").select("*").eq("code", target_code.strip()).execute().data or []
-    if not rows:
-        return {"ok": False, "error": f"لم يتم العثور على الموظف {target_code}"}
-
-    current = rows[0]
-    next_version = int(current.get("version") or 1) + 1
-
-    updated = supabase.table("agents").update({
-        "system_prompt": new_system_prompt.strip(),
-        "version": next_version,
-        "updated_at": "now()",
-    }).eq("id", current["id"]).execute()
-
-    log_evolution(
-        actor_code=actor_code,
-        action_type="update_prompt",
-        target_code=target_code.strip(),
-        details={"new_version": next_version, "reason": reason},
-    )
-    return {"ok": True, "agent": (updated.data or [{}])[0], "version": next_version}
-
-
-def tool_assign_tool(actor_code: str, target_agent_code: str, tool_code: str) -> dict:
-    ag_rows = supabase.table("agents").select("id, code").eq("code", target_agent_code.strip()).execute().data or []
-    tl_rows = supabase.table("tools").select("id, code").eq("code", tool_code.strip()).eq("is_enabled", True).execute().data or []
-
-    if not ag_rows:
-        return {"ok": False, "error": f"الموظف {target_agent_code} غير موجود"}
-    if not tl_rows:
-        return {"ok": False, "error": f"الأداة {tool_code} غير موجودة أو غير مفعلة"}
-
-    agent_id = ag_rows[0]["id"]
-    tool_id = tl_rows[0]["id"]
-
-    existing = (
-        supabase.table("agent_tools")
-        .select("id")
-        .eq("agent_id", agent_id)
-        .eq("tool_id", tool_id)
-        .execute()
-        .data
-        or []
-    )
-    if not existing:
-        supabase.table("agent_tools").insert({
-            "agent_id": agent_id,
-            "tool_id": tool_id,
-        }).execute()
-
-    log_evolution(
-        actor_code=actor_code,
-        action_type="assign_tool",
-        target_code=target_agent_code.strip(),
-        details={"tool_code": tool_code.strip()},
-    )
-    return {"ok": True, "agent_code": target_agent_code.strip(), "tool_code": tool_code.strip()}
-
-
-def run_product_tool_builder(instruction: str, available_tools: list[str]) -> list[str]:
-    pm_agents, _ = get_active_agents_with_tools()
-    pm = next((a for a in pm_agents if a["code"] == "product_manager"), None)
-    if not pm:
-        return []
-
-    prompt = f"""
-{pm.get("system_prompt", "")}
-
-الأدوات المتاحة لك حالياً: {json.dumps(available_tools, ensure_ascii=False)}
-المطلوب: "{instruction}"
-
-إذا كانت هناك حاجة لتسجيل أداة جديدة في قاعدة البيانات، أعد JSON فقط بالشكل التالي:
-{{
-  "register_tools": [
-    {{
-      "code": "كود_الأداة_بالإنجليزية",
-      "name": "اسم الأداة",
-      "description": "وصف الأداة وطريقة استخدامها",
-      "assign_to_agent_code": "كود الموظف المستفيد مثل calendar_assistant أو media_analyst أو manager",
-      "config": {{"type": "http", "method": "GET", "url": ""}}
-    }}
-  ],
-  "summary": "ملخص مختصر"
-}}
-"""
-    res = gemini_client.models.generate_content(
-        model=pm.get("model_name") or DEFAULT_MODEL,
-        contents=prompt,
-        config=sys_config,
-    )
-    parsed = parse_json_response(res.text or "{}")
-    notes = []
-    for item in parsed.get("register_tools") or []:
-        if item.get("code") and item.get("name"):
-            r = tool_register_tool(
-                actor_code="product_manager",
-                code=item["code"],
-                name=item["name"],
-                description=item.get("description") or item["name"],
-                assign_to_agent_code=item.get("assign_to_agent_code") or "manager",
-                config=item.get("config") or {"type": "http", "method": "GET", "url": ""},
-            )
-            if r.get("ok"):
-                notes.append(f"طارق سجّل أداة جديدة: {r['tool_code']} وربطها بـ {r['assigned_to']}")
-    return notes
-
-
-def run_hr_execution(hr_agent: dict, hr_instruction: str, available_tool_codes: list[str]) -> list[dict]:
-    prompt = f"""
-{hr_agent.get("system_prompt", "")}
-
-أنت تنفذ طلباً لتطوير الفريق أو الأدوات تلقائياً.
-الأدوات المتاحة لك حالياً: {json.dumps(available_tool_codes, ensure_ascii=False)}
-
-الطلب:
-"{hr_instruction}"
-
-أعد JSON فقط بدون أي نص خارجه بالشكل التالي:
-{{
-  "actions": [
-    {{
-      "action": "hire_agent" أو "update_prompt" أو "assign_tool",
-      "code": "كود الموظف الجديد بالإنجليزية بحروف صغيرة",
-      "name": "اسم الموظف الجديد",
-      "role": "دور الموظف الجديد",
-      "system_prompt": "تعليمات واضحة للموظف الجديد",
-      "tools": ["create_task"],
-      "target_code": "كود الموظف المراد تطويره",
-      "new_system_prompt": "التعليمات المحدثة",
-      "tool_code": "كود الأداة",
-      "reason": "سبب التطوير أو التعيين"
-    }}
-  ],
-  "hr_summary": "ملخص مختصر لما نفذه الـ HR"
-}}
-"""
-    res = gemini_client.models.generate_content(
-        model=hr_agent.get("model_name") or DEFAULT_MODEL,
-        contents=prompt,
-        config=sys_config,
-    )
-    parsed = parse_json_response(res.text or "{}")
-    results = []
-
-    for act in parsed.get("actions") or []:
-        kind = (act.get("action") or "").strip()
-        if kind == "hire_agent" and "hire_agent" in available_tool_codes:
-            r = tool_hire_agent(
-                actor_code="hr",
-                code=act.get("code") or "specialist_agent",
-                name=act.get("name") or "موظف متخصص",
-                role=act.get("role") or "متابعة المهام المتخصصة",
-                system_prompt=act.get("system_prompt") or "أنت موظف متخصص تنفذ المهام المسندة إليك بدقة وتقدم تقريرك.",
-                tool_codes=act.get("tools") or ["create_task"],
-            )
-            results.append(r)
-        elif kind == "update_prompt" and "update_agent_prompt" in available_tool_codes:
-            r = tool_update_agent_prompt(
-                actor_code="hr",
-                target_code=act.get("target_code") or "manager",
-                new_system_prompt=act.get("new_system_prompt") or "",
-                reason=act.get("reason") or hr_instruction,
-            )
-            results.append(r)
-        elif kind == "assign_tool" and "assign_tool" in available_tool_codes:
-            r = tool_assign_tool(
-                actor_code="hr",
-                target_agent_code=act.get("target_code") or "manager",
-                tool_code=act.get("tool_code") or "create_task",
-            )
-            results.append(r)
-
-    return results
-
-
-def execute_pending_tasks_for_team(
-    agents: list[dict],
-    tools_by_code: dict[str, dict],
-    limit: int = 3,
-) -> list[str]:
-    agents_by_code = {a["code"]: a for a in agents if a.get("code") != "manager"}
+def execute_pending_tasks_for_karim(karim: dict, tools_by_code: dict[str, dict], limit: int = 3) -> list[str]:
     pending_res = (
         supabase.table("tasks")
         .select("*")
@@ -526,14 +322,9 @@ def execute_pending_tasks_for_team(
     summaries = []
 
     for task in pending_tasks:
-        target_code = task.get("assigned_agent_code") or ""
-        worker = agents_by_code.get(target_code)
-        if not worker:
-            continue
-
         tool_outputs = []
-        for t_code in worker.get("tools") or []:
-            if t_code == "create_task":
+        for t_code in karim.get("tools") or []:
+            if t_code in ("create_task", "register_tool", "assign_tool", "hire_agent", "update_agent_prompt"):
                 continue
             tool_row = tools_by_code.get(t_code)
             if tool_row:
@@ -542,7 +333,7 @@ def execute_pending_tasks_for_team(
         tools_context = "\n".join(tool_outputs) if tool_outputs else "لا توجد نتائج أدوات خارجية لهذه المهمة."
 
         prompt = f"""
-{worker.get("system_prompt", "")}
+{karim.get("system_prompt", "")}
 
 مهمة مسندة إليك:
 العنوان: {task.get("title")}
@@ -554,49 +345,35 @@ def execute_pending_tasks_for_team(
 نفّذ المهمة بأفضل صورة عملية ومختصرة واكتب النتيجة النهائية بناءً على البيانات الفعلية بالأعلى، ولو في أداة ناقصها إعداد وضح ذلك بوضوح.
 """
         res = gemini_client.models.generate_content(
-            model=worker.get("model_name") or DEFAULT_MODEL,
+            model=karim.get("model_name") or DEFAULT_MODEL,
             contents=prompt,
             config=sys_config,
         )
         output_text = (res.text or "تم الإنجاز.").strip()
         supabase.table("tasks").update({
             "status": "completed",
-            "notes": f"{task.get('notes') or ''}\n[نتيجة {worker.get('name')}]: {output_text}".strip(),
+            "notes": f"{task.get('notes') or ''}\n[نتيجة كريم]: {output_text}".strip(),
         }).eq("id", task["id"]).execute()
-        summaries.append(f"{worker.get('name')} ({worker.get('role')}): {output_text}")
+        summaries.append(f"كريم: {output_text}")
 
     return summaries
 
 
 def process_user_message(user_text: str, chat_id: str | None = None) -> str:
     agents, tools_by_code = get_active_agents_with_tools()
-    manager = next((a for a in agents if a["code"] == "manager"), None)
-    hr = next((a for a in agents if a["code"] == "hr"), None)
+    karim = resolve_karim_agent(agents)
 
-    if not manager:
-        return "تنبيه: وكيل المدير (manager) غير مفعل في قاعدة البيانات حالياً."
-
-    agents_summary = [
-        {
-            "code": a["code"],
-            "name": a["name"],
-            "role": a["role"],
-            "tools": a["tools"],
-        }
-        for a in agents
-    ]
+    if not karim:
+        return "تنبيه: حساب كريم غير متاح في قاعدة البيانات حالياً."
 
     recent_history = get_chat_history(chat_id, limit=6) if chat_id else []
     history_text = "\n".join(f"{m.get('role')}: {m.get('content')}" for m in recent_history)
 
     prompt = f"""
-{manager.get("system_prompt", "")}
+{karim.get("system_prompt", "")}
 
-أنت نقطة الاتصال مع المستخدم وتجمع عمل الفريق وترد بشكل طبيعي، ودود، ومباشر بدون تكلف أو رسميات زائدة.
-اسمك كريم، وتكلم كمساعد ذكي طبيعي وبسيط من غير ألقاب رسمية ثقيلة.
-
-الفريق الحالي في قاعدة البيانات:
-{json.dumps(agents_summary, ensure_ascii=False, indent=2)}
+أنت "كريم"، المساعد الشخصي الوحيد في النظام. تكلم بأسلوب طبيعي، ودود، ومباشر بدون تكلف أو ألقاب رسمية زائدة.
+الأدوات المتاحة لك حالياً: {json.dumps(karim.get("tools") or [], ensure_ascii=False)}
 
 آخر رسائل المحادثة:
 {history_text or "لا يوجد سجل سابق"}
@@ -606,20 +383,23 @@ def process_user_message(user_text: str, chat_id: str | None = None) -> str:
 
 حدد القرار المناسب وأعد JSON فقط بدون أي شرح خارجي بالشكل التالي:
 {{
-  "decision": "chat" أو "create_task" أو "hire_or_evolve" أو "build_tool",
+  "decision": "chat" أو "create_task" أو "build_tool",
   "task": {{
     "title": "عنوان المهمة إذا كان القرار create_task",
-    "assigned_agent_code": "كود أنسب موظف من الفريق الحالي أو manager",
     "priority": "low أو normal أو high",
     "notes": "ملاحظات مختصرة"
   }},
-  "hr_instruction": "تعليمات للـ HR إذا كان القرار hire_or_evolve",
-  "tool_instruction": "تعليمات لطارق (product_manager) إذا كان القرار build_tool",
+  "tool": {{
+    "code": "كود_الأداة_بالإنجليزية",
+    "name": "اسم الأداة",
+    "description": "وصف الأداة",
+    "config": {{"type": "http", "method": "POST", "url": ""}}
+  }},
   "reply": "الرد النهائي الطبيعي والمباشر بالعربية بدون رسميات زائدة"
 }}
 """
     response = gemini_client.models.generate_content(
-        model=manager.get("model_name") or DEFAULT_MODEL,
+        model=karim.get("model_name") or DEFAULT_MODEL,
         contents=prompt,
         config=sys_config,
     )
@@ -627,36 +407,32 @@ def process_user_message(user_text: str, chat_id: str | None = None) -> str:
     decision = (data.get("decision") or "chat").strip()
     extra_notes = []
 
-    if decision == "create_task" and "create_task" in manager.get("tools", []):
+    if decision == "create_task":
         task_info = data.get("task") or {}
         if task_info.get("title"):
             tool_create_task(
                 title=task_info["title"],
-                assigned_agent_code=task_info.get("assigned_agent_code") or "manager",
+                assigned_agent_code="karim",
                 priority=task_info.get("priority") or "normal",
                 notes=task_info.get("notes") or "",
             )
             updated_agents, updated_tools_by_code = get_active_agents_with_tools()
-            team_outputs = execute_pending_tasks_for_team(updated_agents, updated_tools_by_code, limit=2)
+            updated_karim = resolve_karim_agent(updated_agents) or karim
+            team_outputs = execute_pending_tasks_for_karim(updated_karim, updated_tools_by_code, limit=2)
             extra_notes.extend(team_outputs)
 
-    elif decision == "hire_or_evolve" and hr:
-        hr_instruction = (data.get("hr_instruction") or user_text).strip()
-        hr_results = run_hr_execution(hr, hr_instruction, hr.get("tools") or [])
-        for r in hr_results:
-            if r.get("ok") and "agent" in r and "assigned_tools" in r:
-                ag_new = r["agent"]
-                extra_notes.append(f"تم تعيين موظف جديد: {ag_new.get('name')} ({ag_new.get('code')})")
-            elif r.get("ok") and "version" in r:
-                extra_notes.append(f"تم تحديث تعليمات الموظف إلى النسخة v{r.get('version')}")
-            elif r.get("ok") and "tool_code" in r:
-                extra_notes.append(f"تم ربط الأداة {r.get('tool_code')} بالموظف {r.get('agent_code')}")
-
     elif decision == "build_tool":
-        tool_instruction = (data.get("tool_instruction") or user_text).strip()
-        pm = next((a for a in agents if a["code"] == "product_manager"), None)
-        tool_notes = run_product_tool_builder(tool_instruction, (pm or {}).get("tools") or [])
-        extra_notes.extend(tool_notes)
+        tool_info = data.get("tool") or {}
+        if tool_info.get("code") and tool_info.get("name"):
+            r = tool_register_tool(
+                actor_code="karim",
+                code=tool_info["code"],
+                name=tool_info["name"],
+                description=tool_info.get("description") or tool_info["name"],
+                config=tool_info.get("config") or {"type": "http", "method": "POST", "url": ""},
+            )
+            if r.get("ok"):
+                extra_notes.append(f"تم تسجيل الأداة {r['tool_code']} وربطها بكريم مباشرة")
 
     reply_text = (data.get("reply") or "تمام، أنا معاك.").strip()
     if extra_notes:
@@ -681,7 +457,7 @@ async def analyze_media_with_gemini(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "أهلاً بك! أنا كريم، جاهز أساعدك وأنسّق مع الفريق. قولّي محتاج إيه نبدأ بيه."
+        "أهلاً بك! أنا كريم، جاهز أساعدك. قولّي محتاج إيه نبدأ بيه."
     )
 
 
@@ -781,7 +557,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    logging.info("Kareem office bot is running...")
+    logging.info("Kareem bot is running...")
     app.run_polling(drop_pending_updates=True)
 
 
