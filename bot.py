@@ -18,12 +18,14 @@ logging.basicConfig(
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 KARIM_ID = "380ebfbd-0c61-464e-8ff7-a1380bef8b03"
+DEFAULT_MAKE_WEBHOOK_URL = "https://hook.eu1.make.com/lcbffny8nz5471m3wbng26ye7nb6va6b"
 
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
 SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
 SUPABASE_KEY = (os.getenv("SUPABASE_KEY") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 KARIM_AGENT_ID = (os.getenv("KARIM_AGENT_ID") or KARIM_ID).strip()
+MAKE_WEBHOOK_URL = (os.getenv("MAKE_WEBHOOK_URL") or DEFAULT_MAKE_WEBHOOK_URL).strip()
 
 if not TELEGRAM_TOKEN or not SUPABASE_URL or not SUPABASE_KEY or not GEMINI_API_KEY:
     raise ValueError("تأكد من ضبط TELEGRAM_TOKEN و SUPABASE_URL و SUPABASE_KEY و GEMINI_API_KEY في Render")
@@ -167,15 +169,32 @@ def log_evolution(actor_code: str, action_type: str, target_code: str, details: 
     }).execute()
 
 
-def tool_create_task(title: str, assigned_agent_code: str = "karim", priority: str = "normal", notes: str = "") -> dict:
+def tool_create_task(
+    title: str,
+    assigned_agent_code: str = "karim",
+    priority: str = "normal",
+    notes: str = "",
+    chat_id: str | None = None,
+    user_prompt: str | None = None,
+) -> dict:
+    payload_notes = (notes or "").strip()
+    extra_meta = {}
+    if chat_id:
+        extra_meta["chat_id"] = str(chat_id)
+    if user_prompt:
+        extra_meta["prompt"] = user_prompt
+
     res = supabase.table("tasks").insert({
         "title": title.strip(),
         "status": "pending",
         "assigned_agent_code": (assigned_agent_code or "karim").strip(),
         "priority": (priority or "normal").strip(),
-        "notes": (notes or "").strip(),
+        "notes": payload_notes,
     }).execute()
-    return {"ok": True, "task": (res.data or [{}])[0]}
+    task_row = (res.data or [{}])[0]
+    if extra_meta:
+        task_row["_meta"] = extra_meta
+    return {"ok": True, "task": task_row}
 
 
 def tool_http_request(
@@ -202,13 +221,23 @@ def tool_http_request(
                 headers[str(k)] = str(v)
 
     if clean_method in ("POST", "PUT", "PATCH") and body is not None:
-        data_bytes = json.dumps(body).encode("utf-8")
+        data_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers.setdefault("Content-Type", "application/json")
 
     req = urllib.request.Request(clean_url, data=data_bytes, headers=headers, method=clean_method)
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=25) as resp:
         raw_body = resp.read().decode("utf-8", errors="replace")
         return {"ok": True, "status": resp.status, "response": raw_body[:2500]}
+
+
+def send_to_make_webhook(payload: dict, webhook_url: str | None = None) -> dict:
+    target_url = (webhook_url or MAKE_WEBHOOK_URL or "").strip()
+    if not target_url:
+        return {"ok": False, "error": "رابط Make Webhook غير مضبوط"}
+    try:
+        return tool_http_request(method="POST", url=target_url, body=payload)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def run_configured_tool(tool_row: dict, task: dict) -> str:
@@ -218,7 +247,10 @@ def run_configured_tool(tool_row: dict, task: dict) -> str:
         config = {}
 
     target_url = (config.get("script_url") or config.get("url") or config.get("endpoint") or "").strip()
-    method = (config.get("method") or ("POST" if config.get("body") else "GET")).upper().strip()
+    if not target_url and tool_code in ("make_webhook", "make_video", "make"):
+        target_url = MAKE_WEBHOOK_URL
+
+    method = (config.get("method") or ("POST" if config.get("body") or target_url == MAKE_WEBHOOK_URL else "GET")).upper().strip()
     extra_headers = config.get("headers") if isinstance(config.get("headers"), dict) else None
 
     params = dict(config.get("params") or {}) if isinstance(config.get("params"), dict) else {}
@@ -230,8 +262,15 @@ def run_configured_tool(tool_row: dict, task: dict) -> str:
     body = None
     if method in ("POST", "PUT", "PATCH"):
         body = dict(config.get("body") or {}) if isinstance(config.get("body"), dict) else {}
+        body.setdefault("task_id", task.get("id"))
         body.setdefault("task_title", task.get("title"))
         body.setdefault("task_notes", task.get("notes"))
+        body.setdefault("priority", task.get("priority") or "normal")
+        meta = task.get("_meta") if isinstance(task.get("_meta"), dict) else {}
+        if meta.get("prompt"):
+            body.setdefault("prompt", meta.get("prompt"))
+        if meta.get("chat_id"):
+            body.setdefault("chat_id", meta.get("chat_id"))
 
     if target_url:
         try:
@@ -266,7 +305,11 @@ def tool_register_tool(
     if not clean_code:
         return {"ok": False, "error": "كود الأداة مطلوب"}
 
-    clean_config = config or {"type": "http", "method": "POST", "url": ""}
+    clean_config = dict(config) if isinstance(config, dict) else {"type": "http", "method": "POST", "url": MAKE_WEBHOOK_URL}
+    if not clean_config.get("url") and not clean_config.get("script_url") and not clean_config.get("endpoint"):
+        clean_config["type"] = "http"
+        clean_config["method"] = "POST"
+        clean_config["url"] = MAKE_WEBHOOK_URL
 
     existing = supabase.table("tools").select("id, code").eq("code", clean_code).execute().data or []
     if existing:
@@ -309,7 +352,27 @@ def tool_register_tool(
     return {"ok": True, "tool_code": clean_code, "assigned_to": "karim"}
 
 
-def execute_pending_tasks_for_karim(karim: dict, tools_by_code: dict[str, dict], limit: int = 3) -> list[str]:
+def ensure_default_make_tool_registered():
+    if not MAKE_WEBHOOK_URL:
+        return
+    try:
+        tool_register_tool(
+            actor_code="system",
+            code="make_webhook",
+            name="Make Automation Webhook",
+            description="إرسال المهام والطلبات إلى سيناريو Make لتنفيذ الأتمتة وتوليد المحتوى",
+            config={"type": "http", "method": "POST", "url": MAKE_WEBHOOK_URL},
+        )
+    except Exception as e:
+        logging.warning(f"Could not auto-register make_webhook tool: {e}")
+
+
+def execute_pending_tasks_for_karim(
+    karim: dict,
+    tools_by_code: dict[str, dict],
+    limit: int = 3,
+    extra_task_meta: dict | None = None,
+) -> list[str]:
     pending_res = (
         supabase.table("tasks")
         .select("*")
@@ -322,6 +385,9 @@ def execute_pending_tasks_for_karim(karim: dict, tools_by_code: dict[str, dict],
     summaries = []
 
     for task in pending_tasks:
+        if extra_task_meta:
+            task["_meta"] = extra_task_meta
+
         tool_outputs = []
         for t_code in karim.get("tools") or []:
             if t_code in ("create_task", "register_tool", "assign_tool", "hire_agent", "update_agent_prompt"):
@@ -329,6 +395,19 @@ def execute_pending_tasks_for_karim(karim: dict, tools_by_code: dict[str, dict],
             tool_row = tools_by_code.get(t_code)
             if tool_row:
                 tool_outputs.append(run_configured_tool(tool_row, task))
+
+        if not tool_outputs and MAKE_WEBHOOK_URL:
+            mk_res = send_to_make_webhook({
+                "task_id": task.get("id"),
+                "task_title": task.get("title"),
+                "task_notes": task.get("notes") or "",
+                "priority": task.get("priority") or "normal",
+                **(extra_task_meta or {}),
+            })
+            if mk_res.get("ok"):
+                tool_outputs.append(f"[make_webhook] (HTTP {mk_res.get('status')}): {mk_res.get('response')}")
+            else:
+                tool_outputs.append(f"[make_webhook] فشل الإرسال: {mk_res.get('error')}")
 
         tools_context = "\n".join(tool_outputs) if tool_outputs else "لا توجد نتائج أدوات خارجية لهذه المهمة."
 
@@ -360,6 +439,7 @@ def execute_pending_tasks_for_karim(karim: dict, tools_by_code: dict[str, dict],
 
 
 def process_user_message(user_text: str, chat_id: str | None = None) -> str:
+    ensure_default_make_tool_registered()
     agents, tools_by_code = get_active_agents_with_tools()
     karim = resolve_karim_agent(agents)
 
@@ -374,6 +454,7 @@ def process_user_message(user_text: str, chat_id: str | None = None) -> str:
 
 أنت "كريم"، المساعد الشخصي الوحيد في النظام. تكلم بأسلوب طبيعي، ودود، ومباشر بدون تكلف أو ألقاب رسمية زائدة.
 الأدوات المتاحة لك حالياً: {json.dumps(karim.get("tools") or [], ensure_ascii=False)}
+رابط Make Webhook المتصل بالنظام مضبوط وجاهز لتنفيذ المهام والأتمتة.
 
 آخر رسائل المحادثة:
 {history_text or "لا يوجد سجل سابق"}
@@ -393,7 +474,7 @@ def process_user_message(user_text: str, chat_id: str | None = None) -> str:
     "code": "كود_الأداة_بالإنجليزية",
     "name": "اسم الأداة",
     "description": "وصف الأداة",
-    "config": {{"type": "http", "method": "POST", "url": ""}}
+    "config": {{"type": "http", "method": "POST", "url": "{MAKE_WEBHOOK_URL}"}}
   }},
   "reply": "الرد النهائي الطبيعي والمباشر بالعربية بدون رسميات زائدة"
 }}
@@ -415,10 +496,17 @@ def process_user_message(user_text: str, chat_id: str | None = None) -> str:
                 assigned_agent_code="karim",
                 priority=task_info.get("priority") or "normal",
                 notes=task_info.get("notes") or "",
+                chat_id=chat_id,
+                user_prompt=user_text,
             )
             updated_agents, updated_tools_by_code = get_active_agents_with_tools()
             updated_karim = resolve_karim_agent(updated_agents) or karim
-            team_outputs = execute_pending_tasks_for_karim(updated_karim, updated_tools_by_code, limit=2)
+            team_outputs = execute_pending_tasks_for_karim(
+                updated_karim,
+                updated_tools_by_code,
+                limit=2,
+                extra_task_meta={"chat_id": chat_id, "prompt": user_text},
+            )
             extra_notes.extend(team_outputs)
 
     elif decision == "build_tool":
@@ -429,7 +517,7 @@ def process_user_message(user_text: str, chat_id: str | None = None) -> str:
                 code=tool_info["code"],
                 name=tool_info["name"],
                 description=tool_info.get("description") or tool_info["name"],
-                config=tool_info.get("config") or {"type": "http", "method": "POST", "url": ""},
+                config=tool_info.get("config") or {"type": "http", "method": "POST", "url": MAKE_WEBHOOK_URL},
             )
             if r.get("ok"):
                 extra_notes.append(f"تم تسجيل الأداة {r['tool_code']} وربطها بكريم مباشرة")
@@ -550,6 +638,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     start_health_server()
+    ensure_default_make_tool_registered()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
